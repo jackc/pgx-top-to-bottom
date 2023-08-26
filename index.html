@@ -48,6 +48,13 @@ Jack Christensen
 
 Questions are welcome!
 
+???
+
+* There will be lots of code. Presentation source will be available.
+* Assumes knowledge of Go, PostgreSQL, and basic usage of pgx. For example,
+discussion of stdlib will assume a little knowledge of the pgx interfaces before
+pgx is discussed. We will be going top to bottom and pealing pgx like an onion.
+
 ---
 
 # Primary Packages
@@ -175,25 +182,646 @@ if err != nil {
 * `OpenDB` is simplest interface for customizing connection config
 * `stdlib.RegisterConnConfig` is also available when using a 3rd party wrapper
 that internally calls `sql.Open`.
----
----
----
----
----
----
----
+
 ---
 
+# stdlib - getting a *pgx.Conn
 
+PostgreSQL specific features that are not available through `database/sql` such
+as `COPY` can be accessed by getting a `*pgx.Conn` from the `*sql.DB`.
+
+```go
+// Given db is a *sql.DB
+conn, err := db.Conn(context.Background())
+if err != nil {
+  // handle error from acquiring connection from DB pool
+}
+//
+err = conn.Raw(func(driverConn any) error {
+  conn := driverConn.(*stdlib.Conn).Conn() // conn is a *pgx.Conn
+  // Do pgx specific stuff with conn
+  _, err := conn.CopyFrom(...)
+  return err
+})
+if err != nil {
+  // handle error that occurred while using *pgx.Conn
+}
+```
+
+---
+
+# stdlib - no special privileges
+
+* `stdlib` is built on top of the `pgx` and `pgtype` packages.
+* No special privileges or access to `pgx` internals.
+* Less than 800 lines including comments.
+* Less than 600 actual lines of code.
+* Designed to modular and replaceable.
+
+???
+
+Easy to build alternative database/sql interface on top of pgx or pgconn if
+desired for some reason.
+
+---
+
+# pgxpool
+
+```go
+func main() {
+	ctx := context.Background()
+
+	dbpool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer dbpool.Close()
+
+	var n int32
+	err = dbpool.QueryRow(ctx, "select $1::int", 42).Scan(&n)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Println(n) // => 42
+}
+```
+
+* Core pool logic provided by `github.com/jackc/puddle/v2`.
+
+???
+
+* puddle is a tiny generic resource pool.
+* Even with Go concurrency is really hard. puddle encapsulates the hardest parts.
+
+---
+
+# pgxpool - features
+
+Connection lifecycle callbacks:
+
+* BeforeConnect
+* AfterConnect
+* BeforeAcquire
+* AfterRelease
+* BeforeClose
+
+Pool size control:
+
+* MinConns
+* MaxConns
+* MaxConnIdleTime
+* MaxConnLifetime
+
+---
+
+# pgxpool - statistics
+
+* AcquireCount
+* AcquireDuration
+* AcquiredConns
+* CanceledAcquireCount
+* ConstructingConns
+* EmptyAcquireCount
+* IdleConns
+* TotalConns
+* NewConnsCount
+* MaxLifetimeDestroyCount
+* MaxIdleDestroyCount
+
+---
+
+# pgxpool - escape hatches
+
+* `*pgxpool.Conn` provides `Conn()` method to get the underlying `*pgx.Conn`.
+* `*pgxpool.Conn` provides `Hijack()` method to take a connection from the pool
+  permanently.
+
+---
+
+# pgxpool - no special privileges
+
+* `pgxpool` is built on top of the `pgx` package.
+* No special privileges or access to `pgx` internals.
+* pgxpool is only ~800 lines of code.
+* Designed to modular and replaceable.
+
+???
+
+* Did I mention concurrency is hard?
+* No changes planned. High bar for any proposed changes.
+
+
+---
+
+# pgx - basics
+
+```go
+func main() {
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer conn.Close(ctx)
+
+	var n int32
+	err = conn.QueryRow(ctx, "select $1::int", 42).Scan(&n)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Println(n) // => 42
+}
+```
+
+* pgx is connection oriented.
+* Basic interface mimics `database/sql` but with context by default (`Query`,
+`QueryRow`, `Exec`).
+
+???
+
+Emphasize connection oriented. pgx is not a connection pool. But very similar
+interface to pgxpool. Or really pgxpool has a very similar interface to pgx.
+
+---
+
+# pgx - database/sql style query interface
+
+```go
+var numbers []int32
+rows, err := conn.Query(ctx, "select generate_series(1, 10)")
+if err != nil {
+  // Error check could be omitted as any error is included in rows.
+  log.Fatal(err)
+}
+
+for rows.Next() {
+  var n int32
+  err = rows.Scan(&n)
+  if err != nil {
+    log.Fatal(err)
+  }
+
+  numbers = append(numbers, n)
+}
+
+if rows.Err() != nil {
+  log.Fatal(err)
+}
+
+fmt.Println(numbers) // => [1 2 3 4 5 6 7 8 9 10]
+```
+
+???
+
+* Verbose and error prone.
+* Query only sends query to server. err may be nil even if query eventually
+  fails.
+* Frequent issue is forgetting to check rows.Err().
+
+---
+
+# pgx - CollectRows
+
+```go
+rows, _ := conn.Query(ctx, "select generate_series(1, 10)")
+numbers, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (int32, error) {
+  var n int32
+  err := row.Scan(&n)
+  return n, err
+})
+if err != nil {
+  log.Fatal(err)
+}
+
+fmt.Println(numbers) // => [1 2 3 4 5 6 7 8 9 10]
+```
+
+* `CollectRows` is a generic function that takes a generic `RowToFunc[T]`.
+
+???
+
+Go generics are really useful in pgx.
+
+---
+
+# pgx - CollectRows implementation
+
+```go
+// RowToFunc is a function that scans or otherwise converts row to a T.
+type RowToFunc[T any] func(row CollectableRow) (T, error)
+
+// CollectRows iterates through rows, calling fn for each row, and collecting the results into a slice of T.
+func CollectRows[T any](rows Rows, fn RowToFunc[T]) ([]T, error) {
+	defer rows.Close()
+
+	slice := []T{}
+
+	for rows.Next() {
+		value, err := fn(rows)
+		if err != nil {
+			return nil, err
+		}
+		slice = append(slice, value)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return slice, nil
+}
+```
+
+???
+
+Note the defer rows.Close(). Our previous examples could leak if a panic occurred.
+
+---
+
+# pgx - generic RowTo
+
+```go
+rows, _ := conn.Query(ctx, "select generate_series(1, 10)")
+numbers, err := pgx.CollectRows(rows, pgx.RowTo[int32])
+if err != nil {
+  log.Fatal(err)
+}
+
+fmt.Println(numbers) // => [1 2 3 4 5 6 7 8 9 10]
+```
+
+`RowTo` is a simple generic function as well.
+
+```go
+// RowTo returns a T scanned from row.
+func RowTo[T any](row CollectableRow) (T, error) {
+	var value T
+	err := row.Scan(&value)
+	return value, err
+}
+```
+
+???
+
+* Even better. Now we are down to two statements and an error check.
+
+---
+
+# pgx - builtin RowToFunc functions
+
+* RowTo
+* RowToAddrOf
+* RowToMap
+* RowToStructByPos
+* RowToAddrOfStructByPos
+* RowToStructByName
+* RowToAddrOfStructByName
+* RowToStructByNameLax
+* RowToAddrOfStructByNameLax
+
+???
+
+Functions should be self-explanatory from their names except for Lax.
+
+---
+
+# pgx - struct mapping example
+
+Given the following setup:
+
+```go
+	_, err = conn.Exec(ctx, `
+		create temporary table users (
+			id int primary key generated by default as identity,
+			name text not null,
+			email text not null
+		)`)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	_, err = conn.Exec(ctx, `
+		insert into users (name, email) values
+			('Matthew', 'matthew@example.com'),
+			('Mark', 'mark@example.com'),
+			('Luke', 'luke@example.com'),
+			('John', 'john@example.com'),
+			('Mary', 'mary@example.com'),
+			('Martha', 'martha@example.com')`)
+	if err != nil {
+		log.Fatal(err)
+	}
+```
+
+---
+
+# pgx - struct mapping example (continued)
+
+```go
+	type User struct {
+		ID    int32
+		Name  string
+		Email string
+	}
+
+	rows, _ := conn.Query(ctx, "select id, name, email from users")
+	users, err := pgx.CollectRows(rows, pgx.RowToStructByPos[User])
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	for _, user := range users {
+		fmt.Println(user)
+	}
+
+	// Output:
+	//
+	// {1 Matthew matthew@example.com}
+	// {2 Mark mark@example.com}
+	// {3 Luke luke@example.com}
+	// {4 John john@example.com}
+	// {5 Mary mary@example.com}
+	// {6 Martha martha@example.com}
+```
+
+---
+
+# pgxutil - Select and SelectRow
+
+https://github.com/jackc/pgxutil is where I add personal convenience functions
+and experiment with new ideas that may eventually make it into pgx.
+
+`Select` makes this:
+
+```go
+	rows, _ := conn.Query(ctx, "select id, name, email from users")
+	users, err := pgx.CollectRows(rows, pgx.RowToStructByPos[User])
+```
+
+become this:
+
+```go
+	users, err := pgxutil.Select(ctx, db, "select id, name, email from users",
+    nil, pgx.RowToStructByPos[User])
+```
+
+It completely hides `Rows`.
+
+???
+
+I tend to use `Select` and `SelectRow` for most queries.
+
+---
+
+# pgx - ForEachRow
+
+In the same way the `CollectRows` is an abstraction on collecting all the rows
+of a query, `ForEachRow` is an abstraction on iterating through all the rows of
+a query.
+
+```go
+rows, _ := conn.Query(ctx, "select generate_series(1, 5)")
+var n int32
+_, err = pgx.ForEachRow(rows, []any{&n}, func() error {
+  fmt.Println(n)
+  return nil
+})
+if err != nil {
+  log.Fatal(err)
+}
+
+// Output:
+//
+// 1
+// 2
+// 3
+// 4
+// 5
+```
+
+???
+
+* Less often used than `CollectRows`.
+* Avoids the multiple statements and error checks of `Query`, `Next`, `Scan`,
+  `rows.Err()`.
+* Slightly awkward to declare scan targets outside of function
+* May avoid allocating for every iteration when using complex scan targets.
+
+---
+
+# pgx - pseudo-nested transactions
+
+```go
+// Error handling omitted for brevity.
+
+tx, err := conn.Begin(ctx)
+
+_, err = tx.Exec(ctx, `insert into users (name, email) values
+    ('Matthew', 'matthew@example.com')`)
+
+tx2, err := tx.Begin(ctx)
+
+_, err = tx2.Exec(ctx, `insert into users (name, email) values
+    ('Mark', 'mark@example.com')`)
+
+err = tx2.Rollback(ctx)
+
+err = tx.Commit(ctx)
+
+var n int32
+err = conn.QueryRow(ctx, "select count(*) from users").Scan(&n)
+
+fmt.Println(n) // => 1
+```
+
+---
+
+# pgx - pseudo-nested transactions (continued)
+
+
+* Nested transactions are simulated with savepoints.
+* Savepoints should be used with care on production systems.
+  * https://postgres.ai/blog/20210831-postgresql-subtransactions-considered-harmful
+  * https://about.gitlab.com/blog/2021/09/29/why-we-spent-the-last-month-eliminating-postgresql-subtransactions/
+* But nested transactions can be especially useful in tests. It allows the test
+to be transactional (e.g. rolled back) while still testing transactional
+behavior.
+
+---
+
+# pgx - BeginFunc
+
+`BeginFunc` is a wrapper that automatically rolls back if an error is returned
+and automatically commits if no error is returned.
+
+```go
+pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
+  _, err = tx.Exec(ctx, `insert into users (name, email) values
+    ('Matthew', 'matthew@example.com')`)
+  if err != nil {
+    return err
+  }
+
+  return nil
+})
+```
+
+---
+
+# pgx - Execution protocols and value formats
+
+PostgreSQL has two ways to execute queries:
+
+* Simple protocol - SQL string. Does not support parameterized queries (i.e. potentially unsafe). Only uses text format for results.
+* Extended protocols - separate parse, bind, and execute steps. Supports parameterized queries. Can use binary format for results.
+
+Value formats:
+
+* Text - more understandable, but usually slower
+* Binary - usually faster, but can be ambigous (e.g. 4 bytes could be int32 or float32)
+
+pgx supports both protocols and both formats and prefers the faster binary format when possible.
+
+???
+
+* Text-like types are actually faster in text format.
+
+---
+
+# pgx - Execution protocols and value formats (continued)
+
+The extended protocol allows the client to know the types of the parameters and
+results. However, this requires two network round trips. One to parse and
+describe the statement, and one to execute the statement.
+
+pgx supports fine grained control over the prefered execution mode.
+
+Modes where the value formats are known:
+
+* QueryExecModeCacheStatement - internally prepare and cache statements - one round trip per query after first
+* QueryExecModeCacheDescribe - cache description of statement without preparing - one round trip per query after first
+* QueryExecModeDescribeExec - uses two round trips per query
+
+Modes where the value formats are not known:
+
+* QueryExecModeExec - single round trip in extended protocol
+* QueryExecModeSimpleProtocol - single round trip in simple protocol
+
+???
+
+* These formats can be set for a connection default or per query.
+
+---
+
+# pgx - Batched queries
+
+Network latency can be a significant factor in performance. pgx supports batched
+queries that minimize network round trips.
+
+```go
+batch := &pgx.Batch{}
+batch.Queue("insert into users (name, email) values ($1, $2)", "Matthew", "matthew@example.com")
+batch.Queue("insert into users (name, email) values ($1, $2)", "Mark", "mark@example.com")
+err = conn.SendBatch(ctx, batch).Close()
+if err != nil {
+  log.Fatal(err)
+}
+```
+
+???
+
+Obviously, a single insert statement with multiple rows could have been done instead in this case. But it shows the basic idea.
+
+---
+
+# pgx - Batched queries (continued)
+
+```go
+	batch := &pgx.Batch{}
+	batch.Queue("select 'foo'").QueryRow(func(row pgx.Row) error {
+		var s string
+		err := row.Scan(&s)
+		if err != nil {
+			return err
+		}
+		fmt.Println(s) // => foo
+		return nil
+	})
+	batch.Queue("select 'bar'").QueryRow(func(row pgx.Row) error {
+		var s string
+		err := row.Scan(&s)
+		if err != nil {
+			return err
+		}
+		fmt.Println(s) // => foo
+		return nil
+	})
+	err = conn.SendBatch(ctx, batch).Close()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Output:
+	//
+	// foo
+	// bar
+```
+
+???
+
+* Callbacks can be registered for each queued query.
+* The result of SendBatch can be iterated and the results handled there, but in most cases the callbacks are more convenient.
+
+---
+
+# pgx - Batched queries (continued)
+
+* Batches are implicitly transactional. If any query in the batch fails the entire batch is rolled back.
+* There are limits on the number of queries that can be batched together.
+* Unfortunately, these limits vary and are not clearly defined.
+* If read and write network buffers are filled a delay may occur until pgx notices the deadlock and starts a background read to unblock it.
+* Implicit transactions seem to have some sort of memory limit in PostgreSQL. Users have reported PostgreSQL errors with very large batches.
+* 1000 queries seems to be a good size that balances performance with staying well away from the limits.
+
+---
+
+# pgx - other advanced or lesser known features
+
+* `CopyFrom` should be preferred for bulk inserts. It is significantly faster
+  than insert even for as few as 5 rows.
+* `WaitForNotification` is a convenient
+  way to listen for PostgreSQL notifications. It buffers notifications internally
+  so it is safe to use a single connection for queries and to occasionally check
+  for notifications.
+* Tracing interfaces are provided for logging and to allow integration with projects like OpenTelemetry.
+* Large object support.
+
+---
+
+???
+
+* Large objects -- for when you want PostgreSQL to be your file system.
 
 ## TODO
 
-get pgx connection from database/sql
-stdlib doesn't get any special access
+pgx - no privileged access to pgconn or pgtype
 
-CollectRows / RowTo interface
-
+pgtype - map and codec system
+different ways of overriding types
 Nested structs vs batching
+
+pgconn
+lower level query interface
+pipelining
+hijack
+
+pgproto3
+debug tracing
+cowsay
+
 
     </textarea>
   <script src="https://remarkjs.com/downloads/remark-latest.min.js">
