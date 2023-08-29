@@ -50,7 +50,7 @@ Questions are welcome!
 
 ???
 
-* There will be lots of code. Presentation source will be available.
+* There will be lots of code. Presentation source will be available. There are over 20 sample programs in the repo.
 * Assumes knowledge of Go, PostgreSQL, and basic usage of pgx. For example,
 discussion of stdlib will assume a little knowledge of the pgx interfaces before
 pgx is discussed. We will be going top to bottom and pealing pgx like an onion.
@@ -799,28 +799,712 @@ Obviously, a single insert statement with multiple rows could have been done ins
 * Tracing interfaces are provided for logging and to allow integration with projects like OpenTelemetry.
 * Large object support.
 
----
-
 ???
 
 * Large objects -- for when you want PostgreSQL to be your file system.
 
-## TODO
+---
 
-pgx - no privileged access to pgconn or pgtype
+# pgx - no special privileges and escape hatches
 
-pgtype - map and codec system
-different ways of overriding types
-Nested structs vs batching
+* No privileged access to pgconn or pgtype.
+* Conn.TypeMap() gives access to underlying pgtype system
+* Conn.PgConn() gives access to underlying pgconn system
 
-pgconn
-lower level query interface
-pipelining
-hijack
+???
 
-pgproto3
-debug tracing
-cowsay
+* Recurring theme - pgx is modular and built in layers
+
+---
+
+# pgtype - overview
+
+pgtype is responsible for converting between Go and PostgreSQL types.
+
+## Key concepts
+
+* PostgreSQL types are identified by OID (object ID)
+* `Map` is the primary interface responsible for encoding parameters and decodings results
+* A `Codec` is registered with a `Map` for a specific OID.
+* A `Codec` does not directly encode or decode values. It returns an `EncodePlan` or a `ScanPlan`.
+* A `Codec` typically exposes custom `*Scanner` and `*Valuer` interfaces for easy extension.
+
+???
+
+* The largest pgx component
+* Rather complicated
+
+---
+
+# pgtype - Extending a built-in type
+
+```go
+type CircleF32 struct {
+	X float32
+	Y float32
+	R float32
+}
+
+func (c *CircleF32) ScanCircle(v pgtype.Circle) error {
+	if !v.Valid {
+		return fmt.Errorf("cannot scan null circle")
+	}
+
+	c.X = float32(v.P.X)
+	c.Y = float32(v.P.Y)
+	c.R = float32(v.R)
+
+	return nil
+}
+
+func (c CircleF32) CircleValue() (pgtype.Circle, error) {
+	return pgtype.Circle{
+		P: pgtype.Vec2{
+			X: float64(c.X),
+			Y: float64(c.Y),
+		},
+		R:     float64(c.R),
+		Valid: true,
+	}, nil
+}
+```
+
+???
+
+* CircleF32 uses float32 instead of float64 and cannot be null
+
+---
+
+# pgtype - Extending a built-in type (continued)
+
+```go
+var c CircleF32
+err = conn.QueryRow(ctx, "select '<(3,4),2>'::circle").Scan(&c)
+if err != nil {
+  log.Fatal(err)
+}
+
+fmt.Println(c.X, c.Y, c.R) // => 3 4 2
+```
+
+???
+
+* This allows custom types to be encoded as query parameters and scanned from
+query results without needing to parse from or format to the PostgreSQL text or
+binary formats for that type.
+
+---
+
+# pgtype - Adding a new Codec
+
+* Codecs can be registered for new types
+* Codecs for existing types can be replaced
+* Codecs can be fairly complicated
+  * Plan(s) to encode binary
+  * Plan(s) to encode text
+  * Plan(s) to scan binary
+  * Plan(s) to scan text
+  * Type and interfaces for easy extension
+* The CircleCodec is ~200 lines of code
+
+???
+
+* It should be rare to need to add a new codec. But it is possible.
+* The entire type system can be overridden if desired.
+* If you want to create a Codec I suggest reading the package docs for pgtype
+  and then looking at the source for one of the simple built-in types like CircleCodec.
+
+---
+
+# pgtype - the plan system
+
+Wouldn't it be nice if these types were could directly be used without implementing `Scan` or `Value` like in `database/sql`?
+
+```go
+type Tag string
+
+var tags []Tag
+err = conn.QueryRow(ctx, "select array['foo', 'bar', 'baz']").Scan(&tags)
+if err != nil {
+  log.Fatal(err)
+}
+
+fmt.Println(tags) // => [foo bar baz]
+```
+
+* In pgx they can be!
+* plans provide the flexibility and the performance
+
+---
+
+# pgtype - the plan system (continued)
+
+If a Go value is not supported directly by a Codec then Map will try wrapping it with additional logic and try again.
+
+```go
+func NewMap() *Map {
+  // ...
+
+	return &Map{
+		// ...
+		TryWrapEncodePlanFuncs: []TryWrapEncodePlanFunc{
+			TryWrapDerefPointerEncodePlan,
+			TryWrapBuiltinTypeEncodePlan,
+			TryWrapFindUnderlyingTypeEncodePlan,
+			TryWrapStructEncodePlan,
+			TryWrapSliceEncodePlan,
+			TryWrapMultiDimSliceEncodePlan,
+			TryWrapArrayEncodePlan,
+		},
+
+		TryWrapScanPlanFuncs: []TryWrapScanPlanFunc{
+			TryPointerPointerScanPlan,
+			TryWrapBuiltinTypeScanPlan,
+			TryFindUnderlyingTypeScanPlan,
+			TryWrapStructScanPlan,
+			TryWrapPtrSliceScanPlan,
+			TryWrapPtrMultiDimSliceScanPlan,
+			TryWrapPtrArrayScanPlan,
+		},
+	}
+}
+```
+
+---
+
+# pgtype - the plan system (continued)
+
+* These "try wrap" functions are tried in order and recursively.
+* This allows supporting many types without the Codec needing to know about
+them.
+* It also could be slow to try so many options. That is the other side of the
+"plan" system. Plans are cached internally by `Map`. So the expensive planning
+process is only done once per type.
+* Types can be seamlessly integrated without modification by adding "try wrap"
+functions that directly look for that type. e.g. `time.Duration`,
+`shopspring/decimal`, `github.com/gofrs/uuid`, etc.
+* Code can be somewhat daunting. See https://github.com/jackc/pgx-gofrs-uuid/ for example.
+
+---
+
+# pgtype - arrays and composite types
+
+```go
+_, err = conn.Exec(ctx, `
+create table teams (
+  name text primary key
+);
+
+create table players (
+  team_name text references teams(name),
+  name text,
+  number int
+);
+
+insert into teams (name) values ('Bulls');
+insert into players (team_name, name, number) values
+  ('Bulls', 'Michael Jordan', 23),
+  ('Bulls', 'Scottie Pippen', 33),
+  ('Bulls', 'Dennis Rodman', 91);
+`)
+```
+
+???
+
+Note that multiple statements are given in a single Exec. This works if there
+are no parameters because Exec automatically uses the simple protocol.
+
+---
+
+# pgtype - arrays and composite types
+
+Wouldn't it be nice if this worked?
+
+```go
+type Team struct {
+	Name    string
+	Players []*Player
+}
+
+type Player struct {
+	Name   string
+	Number int32
+}
+```
+
+```go
+var team Team
+err = conn.QueryRow(ctx, `
+  select name, (
+    select array_agg(row(name, number) order by name)
+    from players
+    where team_name = teams.name
+  ) as players
+  from teams
+  where name = 'Bulls'`,
+).Scan(&team.Name, &team.Players)
+```
+
+???
+
+Sorry this example gets split among many slides.
+
+---
+
+# pgtype - arrays and composite types
+
+Arrays and composite types (usually) just work!
+
+```go
+fmt.Println(team.Name)
+for _, player := range team.Players {
+  fmt.Println(player.Name, player.Number)
+}
+
+// Output:
+// Bulls
+// Dennis Rodman 91
+// Michael Jordan 23
+// Scottie Pippen 33
+```
+
+* Can be simpler than an ORM or batching to load an object graph. Potentially
+better performance as well.
+* PostgreSQL `record` / `row` type usually requires the extended protocol and
+binary format.
+
+---
+
+# pgtype - miscellaneous
+
+* pgtype works with byte slices, OIDs, and Go values (i.e. it's decoupled from
+pgx and pgconn)
+* `Map.RegisterDefaultPgType` allows registering a presumed PostgreSQL type for
+a Go type for when the PostgreSQL type is unknown (such as using the simple
+protocol)
+* `pgx.Conn.LoadType()` + `pgtype.Map.RegisterType()` allows registering custom
+types like enums or composites.
+
+---
+
+# pgconn - introduction
+
+* Similar to the C libpq.
+* Low-level connection interface.
+* Does not do any type conversions. Uses OIDs and `[]byte` directly.
+* Rarely used directly.
+* But some features are only available at this very low level.
+
+---
+
+# pgconn - introduction
+
+```go
+conn, err := pgconn.Connect(ctx, os.Getenv("DATABASE_URL"))
+if err != nil {
+  log.Fatal(err)
+}
+defer conn.Close(ctx)
+
+mrr := conn.Exec(ctx, `
+  select 'Hello, world';
+  select 'Goodbye, world';`,
+)
+for mrr.NextResult() { // loop through each result set
+  for mrr.ResultReader().NextRow() { // loop through each row in the result set
+    row := mrr.ResultReader().Values()
+    fmt.Println(string(row[0]))
+  }
+}
+err = mrr.Close()
+if err != nil {
+  log.Fatal(err)
+}
+```
+
+???
+
+* Connection is basically the same as pgx, pgxpool, and stdlib. Core logic is here and they only layer onto it.
+* Uses the simple protocol. Multiple queries can be included in a single Exec.
+
+---
+
+# pgconn - extended protocol
+
+```go
+	rr := conn.ExecParams(ctx,
+		`select n, n::float * 1.1, n::float * 1.1 from generate_series(1, $1) n;`,
+		[][]byte{[]byte("3")}, // param values
+		nil,                   // param OIDs (let PostgreSQL infer them)
+		nil,                   // param formats (defaults to text)
+		[]int16{0, 0, 1},      // result formats (text, text, binary)
+	)
+
+	for rr.NextRow() {
+		row := rr.Values()
+		fmt.Printf(
+			"%v (%v), %v (%v), %v\n",
+			row[0], string(row[0]), row[1], string(row[1]), row[2],
+		)
+	}
+	commandTag, err := rr.Close()
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(commandTag)
+
+	// Output:
+	//
+	// [49] (1), [49 46 49] (1.1), [63 241 153 153 153 153 153 154]
+	// [50] (2), [50 46 50] (2.2), [64 1 153 153 153 153 153 154]
+	// [51] (3), [51 46 51 48 48 48 48 48 48 48 48 48 48 48 48 48 48 51] (3.3000000000000003), [64 10 102 102 102 102 102 103]
+	// SELECT 3
+```
+
+???
+
+* Extended protocol safely separates parameters from query text.
+* Control over exactly how parameters and results are encoded and decoded.
+
+---
+
+# pgconn - pipeline mode
+
+* Precise control over when network round trips occur.
+* Can be very verbose
+* Queries are not sent until `Sync` is called.
+
+```go
+pipeline := conn.StartPipeline(ctx)
+pipeline.SendQueryParams(`select 1`, nil, nil, nil, nil)
+pipeline.SendQueryParams(`select 2`, nil, nil, nil, nil)
+pipeline.SendQueryParams(`select 3`, nil, nil, nil, nil)
+err = pipeline.Sync()
+if err != nil {
+  log.Fatal(err)
+}
+```
+
+---
+
+# pgconn - pipeline mode (continued)
+
+```go
+// Query 1
+
+results, err := pipeline.GetResults()
+if err != nil {
+  log.Fatal(err)
+}
+
+rr, ok := results.(*pgconn.ResultReader)
+if !ok {
+  log.Fatalf("expected ResultReader, got: %#v", results)
+}
+
+for rr.NextRow() {
+  row := rr.Values()
+  fmt.Println(string(row[0])) // 1
+}
+commandTag, err := rr.Close()
+if err != nil {
+  log.Fatal(err)
+}
+fmt.Println(commandTag) // SELECT 1
+```
+
+---
+
+# pgconn - pipeline mode (continued)
+
+```go
+// Query 2
+
+results, err = pipeline.GetResults()
+if err != nil {
+  log.Fatal(err)
+}
+
+rr, ok = results.(*pgconn.ResultReader)
+if !ok {
+  log.Fatalf("expected ResultReader, got: %#v", results)
+}
+
+for rr.NextRow() {
+  row := rr.Values()
+  fmt.Println(string(row[0])) // 2
+}
+commandTag, err = rr.Close()
+if err != nil {
+  log.Fatal(err)
+}
+fmt.Println(commandTag) // SELECT 1
+```
+
+---
+
+# pgconn - pipeline mode (continued)
+
+```go
+// Query 3
+
+results, err = pipeline.GetResults()
+if err != nil {
+  log.Fatal(err)
+}
+
+rr, ok = results.(*pgconn.ResultReader)
+if !ok {
+  log.Fatalf("expected ResultReader, got: %#v", results)
+}
+
+for rr.NextRow() {
+  row := rr.Values()
+  fmt.Println(string(row[0])) // 3
+}
+commandTag, err = rr.Close()
+if err != nil {
+  log.Fatal(err)
+}
+fmt.Println(commandTag) // SELECT 1
+```
+
+---
+
+# pgconn - pipeline mode (continued)
+
+```go
+// Sync response
+
+results, err = pipeline.GetResults()
+if err != nil {
+  log.Fatal(err)
+}
+
+_, ok = results.(*pgconn.PipelineSync)
+if !ok {
+  log.Fatalf("expected ResultReader, got: %#v", results)
+}
+```
+
+???
+
+Note that `GetResults` can return multiple types.
+
+---
+
+# pgconn - pipeline mode (continued)
+
+```go
+	// Send more queries
+
+	pipeline.SendQueryParams(`select 4`, nil, nil, nil, nil)
+	pipeline.SendQueryParams(`select 5`, nil, nil, nil, nil)
+	err = pipeline.Sync()
+	if err != nil {
+		log.Fatal(err)
+	}
+```
+
+---
+
+# pgconn - pipeline mode (continued)
+
+* Reading those results is omitted.
+* Finally close the pipeline to return the connection to normal operation.
+
+```go
+	err = pipeline.Close()
+	if err != nil {
+		log.Fatal(err)
+	}
+```
+
+* Used to implement pgx batching.
+* Can also prepare and deallocate statements.
+* Nearly but not quite at the level of individual protocol messages over the wire.
+* Requires a fair amount of understanding of the PostgreSQL protocol.
+
+???
+
+* Did I mention it is very verbose?
+
+---
+
+## pgconn - copy
+
+* `CopyFrom` and `CopyTo` directly expose `io.Reader` and `io.Writer` interfaces to
+  the PostgreSQL copy protocol.
+* Callers are responsible for formatting or parsing the data.
+* Can be used to copy data between PostgreSQL servers.
+
+```go
+	r, w := io.Pipe()
+	errChan := make(chan error)
+	go func() {
+		_, err := sourceDBConn.CopyTo(ctx, w, "copy (select ...) to stdout")
+		w.Close()
+		errChan <- err
+	}()
+
+	_, err := destDBConn.CopyFrom(ctx, r, "copy tablename from stdin")
+	if err != nil {
+		return fmt.Errorf("copy from failed: %w", err)
+	}
+	err = <-errChan
+	if err != nil {
+		return fmt.Errorf("copy to failed: %w", err)
+	}
+```
+
+???
+
+Example adapted from actual use.
+
+---
+
+# pgconn - escape hatches
+
+* `Frontend()` allows direct access to the underlying `pgproto3.Frontend`.
+* `ReceiveMessage` allows directly reading a message from the server.
+* `Conn()` allows direct access to the underlying `net.Conn`.
+* `Hijack()` exposes internal state such as `PID` and `SecretKey` and takes over the `net.Conn`.
+
+???
+
+* These are rarely needed. But they are available if needed.
+* Hijack in particular would allow another database driver to be bootstrapped on
+top of pgconn. It could use pgconn to handle the connection and authentication
+process and then take over.
+* SecretKey is used to cancel queries.
+
+---
+
+# pgproto3 - introduction
+
+* pgproto3 handles parsing and encoding of the PostgreSQL wire protocol.
+* Typical client applications should rarely if ever need to use it directly.
+* It can be useful for implementing load balancers, proxies, or other PostgreSQL middleware.
+
+---
+
+# pgproto3 - debug tracing
+
+```go
+conn.Frontend().Trace(os.Stdout, pgproto3.TracerOptions{
+  SuppressTimestamps: true,
+  RegressMode:        true,
+})
+
+mrr := conn.Exec(ctx, `
+  select 'Hello, world';
+  select 'Goodbye, world';`,
+)
+err = mrr.Close()
+if err != nil {
+  log.Fatal(err)
+}
+```
+
+```
+F	Query	58	 "
+		select 'Hello, world';
+		select 'Goodbye, world';"
+B	RowDescription	34	 1 "?column?" 0 0 25 -1 -1 0
+B	DataRow	23	 1 12 'Hello, world'
+B	CommandComplete	14	 "SELECT 1"
+B	RowDescription	34	 1 "?column?" 0 0 25 -1 -1 0
+B	DataRow	25	 1 14 'Goodbye, world'
+B	CommandComplete	14	 "SELECT 1"
+B	ReadyForQuery	6	 I
+```
+
+???
+
+* F = frontend
+* B = backend
+
+---
+
+# pgproto3 - debug tracing (continued)
+
+```go
+	rr := conn.ExecParams(ctx,
+		`select n, n::float * 1.1, n::float * 1.1 from generate_series(1, $1) n;`,
+		[][]byte{[]byte("3")}, // param values
+		nil,                   // param OIDs (let PostgreSQL infer them)
+		nil,                   // param formats (defaults to text)
+		[]int16{0, 0, 1},      // result formats (text, text, binary)
+	)
+	_, err = rr.Close()
+	if err != nil {
+		log.Fatal(err)
+	}
+```
+
+```
+F	Parse	80	 "" "select n, n::float * 1.1, n::float * 1.1 from generate_series(1, $1) n;" 0
+F	Bind	24	 "" "" 0 1 '3' 3 0 0 1
+F	Describe	7	 P ""
+F	Execute	10	 "" 0
+F	Sync	5
+B	ParseComplete	5
+B	BindComplete	5
+B	RowDescription	81	 3 "n" 0 0 23 4 -1 0 "?column?" 0 0 701 8 -1 0 "?column?" 0 0 701 8 -1 1
+B	DataRow	31	 3 1 '1' 3 '1.1' 8 '?\xf1\x99\x99\x99\x99\x99\x9a'
+B	DataRow	31	 3 1 '2' 3 '2.2' 8 '@\x1\x99\x99\x99\x99\x99\x9a'
+B	DataRow	46	 3 1 '3' 18 '3.3000000000000003' 8 '@\xafffffg'
+B	CommandComplete	14	 "SELECT 3"
+B	ReadyForQuery	6	 I
+```
+
+???
+
+* Notice the difference between the simple and extended protocols.
+* Also the difference between text and binary formats.
+* Useful for debugging and developing pgx itself.
+* Also sometimes useful for confirming exactly what is happening over the wire.
+
+---
+
+# pgproto3 - pgfortune example
+
+```
+jack@127.0.0.1:15432 jack=# select 'What?';
+                  fortune
+────────────────────────────────────────────
+  ________________________________________ ↵
+ / It's very inconvenient to be mortal -- \↵
+ | you never know when everything may     |↵
+ \ suddenly stop happening.               /↵
+  ---------------------------------------- ↵
+  \     /\  ___  /\                        ↵
+   \   // \/   \/ \\                       ↵
+      ((    O O    ))                      ↵
+       \\ /     \ //                       ↵
+        \/  | |  \/                        ↵
+         |  | |  |                         ↵
+         |  | |  |                         ↵
+         |   o   |                         ↵
+         | |   | |                         ↵
+         |m|   |m|                         ↵
+
+(1 row)
+```
+
+???
+
+* This brings us back to the beginning. pgproto3 is used to implement a simple mock PostgreSQL server that responds with `fortune | cowsay`.
+* Source is in pgx repo under the pgproto3/example/pgfortune.
+* Look at source code if there is time.
+
+---
+
+# Thank You!
+
+Source code and slides: https://github.com/jackc/pgx-top-to-bottom
+
+
 
 
     </textarea>
